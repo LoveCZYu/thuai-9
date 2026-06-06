@@ -32,13 +32,23 @@ def _serialize_match(match: Match) -> MatchOut:
 
 
 async def _select_current_or_latest_match(db: AsyncSession) -> Match | None:
-    live_result = await db.execute(
+    running_result = await db.execute(
         select(Match)
-        .where(Match.status.in_(["pending", "running"]))
+        .where(Match.status == "running")
         .order_by(Match.scheduled_at.desc(), Match.id.desc())
         .limit(1)
     )
-    match = live_result.scalar_one_or_none()
+    match = running_result.scalar_one_or_none()
+    if match is not None:
+        return match
+
+    pending_result = await db.execute(
+        select(Match)
+        .where(Match.status == "pending")
+        .order_by(Match.scheduled_at.asc(), Match.id.asc())
+        .limit(1)
+    )
+    match = pending_result.scalar_one_or_none()
     if match is not None:
         return match
 

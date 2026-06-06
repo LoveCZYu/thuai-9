@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import random
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -12,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from compiler import compile_submission
 from config import settings
 from runner import GAME_TIMEOUT_SECONDS, MatchAgent, cleanup_runtime_containers, run_match
+from tournament import build_double_round_robin
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -55,10 +55,15 @@ class Submission(Base):
 
 class Match(Base):
     __tablename__ = "matches"
+    __table_args__ = (
+        Index("ix_matches_competition", "competition_id"),
+    )
+
     id = Column(Integer, primary_key=True)
     mode = Column(String(8), nullable=False)
     submission_a_id = Column(Integer, ForeignKey("submissions.id"), nullable=False)
     submission_b_id = Column(Integer, ForeignKey("submissions.id"), nullable=False)
+    competition_id = Column(Integer)
     status = Column(String(16), nullable=False)
     score_a = Column(BigInteger)
     score_b = Column(BigInteger)
@@ -263,46 +268,63 @@ async def _schedule_due_competition(db: AsyncSession) -> bool:
             continue
         ready_entries.append((slot, submission))
 
-    if not ready_entries:
+    if len(ready_entries) < 2:
         competition.status = "error"
         competition.error_log = "\n".join(
-            ["赛事到时后没有可运行的 ready 提交。", *skipped]
+            ["Competition needs at least two ready submissions for double round robin.", *skipped]
         ).strip()
         competition.finished_at = now
         await db.commit()
-        logger.warning("Competition %d could not start: no ready participants", competition.id)
+        logger.warning(
+            "Competition %d could not start: only %d ready participant(s)",
+            competition.id,
+            len(ready_entries),
+        )
         return True
 
-    first_submission = ready_entries[0][1]
-    second_submission = ready_entries[1][1] if len(ready_entries) >= 2 else first_submission
-    match = Match(
-        mode="event",
-        submission_a_id=first_submission.id,
-        submission_b_id=second_submission.id,
-        status="pending",
-        scheduled_at=competition.scheduled_at,
-    )
-    db.add(match)
+    match_specs = build_double_round_robin(ready_entries)
+    matches: list[Match] = []
+    for index, ((_, first_submission), (_, second_submission)) in enumerate(match_specs):
+        match = Match(
+            mode="event",
+            competition_id=competition.id,
+            submission_a_id=first_submission.id,
+            submission_b_id=second_submission.id,
+            status="pending",
+            scheduled_at=competition.scheduled_at + timedelta(seconds=index),
+        )
+        db.add(match)
+        matches.append(match)
     await db.flush()
 
-    db.add_all([
-        MatchParticipant(
-            match_id=match.id,
-            submission_id=submission.id,
-            team_id=slot.team_id,
-            player_token=secrets.token_urlsafe(24),
-        )
-        for slot, submission in ready_entries
-    ])
+    participants: list[MatchParticipant] = []
+    for match, (first_entry, second_entry) in zip(matches, match_specs):
+        first_slot, first_submission = first_entry
+        second_slot, second_submission = second_entry
+        participants.extend([
+            MatchParticipant(
+                match_id=match.id,
+                submission_id=first_submission.id,
+                team_id=first_slot.team_id,
+                player_token=secrets.token_urlsafe(24),
+            ),
+            MatchParticipant(
+                match_id=match.id,
+                submission_id=second_submission.id,
+                team_id=second_slot.team_id,
+                player_token=secrets.token_urlsafe(24),
+            ),
+        ])
+    db.add_all(participants)
 
-    competition.match_id = match.id
+    competition.match_id = matches[0].id
     competition.status = "running"
     competition.error_log = "\n".join(skipped).strip() or None
     await db.commit()
     logger.info(
-        "Scheduled competition %d into match %d with submissions=%s",
+        "Scheduled competition %d into %d double round-robin matches with submissions=%s",
         competition.id,
-        match.id,
+        len(matches),
         [submission.id for _, submission in ready_entries],
     )
     return True
@@ -397,7 +419,7 @@ async def compile_loop():
 
 
 async def arena_loop():
-    """Schedule one live arena match containing every team with a ready submission."""
+    """Schedule double round-robin arena matches for dispatched submissions."""
     while True:
         try:
             async with AsyncSessionLocal() as db:
@@ -443,37 +465,54 @@ async def arena_loop():
                         seen_teams.add(sub.team_id)
                         ready.append(sub)
 
-                if len(ready) >= 1:
-                    random.shuffle(ready)
-                    a = ready[0]
-                    b = ready[1] if len(ready) >= 2 else ready[0]
-                    match = Match(
-                        mode="arena",
-                        submission_a_id=a.id,
-                        submission_b_id=b.id,
-                        status="pending",
-                    )
-                    db.add(match)
+                if len(ready) >= 2:
+                    match_specs = build_double_round_robin(ready)
+                    if next_competition_time is not None:
+                        now = datetime.now(timezone.utc)
+                        guard_until = now + timedelta(seconds=GAME_TIMEOUT_SECONDS * len(match_specs))
+                        if next_competition_time <= guard_until:
+                            await asyncio.sleep(30)
+                            continue
+
+                    matches: list[Match] = []
+                    now = datetime.now(timezone.utc)
+                    for index, (first_submission, second_submission) in enumerate(match_specs):
+                        match = Match(
+                            mode="arena",
+                            submission_a_id=first_submission.id,
+                            submission_b_id=second_submission.id,
+                            status="pending",
+                            scheduled_at=now + timedelta(seconds=index),
+                        )
+                        db.add(match)
+                        matches.append(match)
                     await db.flush()
                     # The player_token doubles as the live-server auth credential
                     # (it gets loaded into the game server's TOKENS allowlist), so
                     # it must be an unguessable secret — never derivable from public
                     # ids. Anyone who learns it could bind to the live WebSocket as
                     # that team's agent.
-                    participants = [
-                        MatchParticipant(
-                            match_id=match.id,
-                            submission_id=sub.id,
-                            team_id=sub.team_id,
-                            player_token=secrets.token_urlsafe(24),
-                        )
-                        for sub in ready
-                    ]
+                    participants: list[MatchParticipant] = []
+                    for match, (first_submission, second_submission) in zip(matches, match_specs):
+                        participants.extend([
+                            MatchParticipant(
+                                match_id=match.id,
+                                submission_id=first_submission.id,
+                                team_id=first_submission.team_id,
+                                player_token=secrets.token_urlsafe(24),
+                            ),
+                            MatchParticipant(
+                                match_id=match.id,
+                                submission_id=second_submission.id,
+                                team_id=second_submission.team_id,
+                                player_token=secrets.token_urlsafe(24),
+                            ),
+                        ])
                     db.add_all(participants)
                     await db.commit()
                     logger.info(
-                        "Scheduled live arena match %d: submissions=%s",
-                        match.id,
+                        "Scheduled %d live arena double round-robin matches: submissions=%s",
+                        len(matches),
                         [sub.id for sub in ready],
                     )
         except Exception:
@@ -520,6 +559,40 @@ async def _persist_match_logs(match_id, agents, agent_logs):
             await _prune_submission_logs(db, {agent.submission_id for agent in agents})
     except Exception:
         logger.exception("failed to persist match logs for match %d", match_id)
+
+
+async def _find_competition_for_match(db: AsyncSession, match: Match) -> Competition | None:
+    if match.competition_id is not None:
+        result = await db.execute(
+            select(Competition).where(Competition.id == match.competition_id).limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    result = await db.execute(
+        select(Competition).where(Competition.match_id == match.id).limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _competition_match_status_counts(
+    db: AsyncSession,
+    competition: Competition,
+) -> dict[str, int]:
+    result = await db.execute(
+        select(Match.status, func.count())
+        .where(Match.competition_id == competition.id)
+        .group_by(Match.status)
+    )
+    counts = {status: int(count) for status, count in result.all()}
+    if counts or competition.match_id is None:
+        return counts
+
+    legacy_result = await db.execute(
+        select(Match.status, func.count())
+        .where(Match.id == competition.match_id)
+        .group_by(Match.status)
+    )
+    return {status: int(count) for status, count in legacy_result.all()}
 
 
 async def match_runner_loop():
@@ -591,10 +664,7 @@ async def match_runner_loop():
                             ),
                         ]
 
-                    competition_result = await db.execute(
-                        select(Competition).where(Competition.match_id == match.id).limit(1)
-                    )
-                    competition = competition_result.scalar_one_or_none()
+                    competition = await _find_competition_for_match(db, match)
 
                     scores, error_log, agent_logs = await asyncio.get_running_loop().run_in_executor(
                         None,
@@ -614,6 +684,7 @@ async def match_runner_loop():
                                 .values(score=scores.get(row.submission_id))
                             )
 
+                    finished_at = datetime.now(timezone.utc)
                     await db.execute(
                         update(Match)
                         .where(Match.id == match.id)
@@ -622,21 +693,37 @@ async def match_runner_loop():
                             score_a=score_a,
                             score_b=score_b,
                             error_log=error_log or None,
-                            finished_at=datetime.now(timezone.utc),
+                            finished_at=finished_at,
                         )
                     )
 
                     if competition is not None:
+                        status_counts = await _competition_match_status_counts(db, competition)
+                        unfinished_matches = status_counts.get("pending", 0) + status_counts.get("running", 0)
+                        failed_matches = status_counts.get("error", 0)
+                        competition_finished_at = finished_at if unfinished_matches == 0 else None
+                        competition_status = (
+                            "error"
+                            if unfinished_matches == 0 and failed_matches > 0
+                            else "finished"
+                            if unfinished_matches == 0
+                            else "running"
+                        )
                         combined_error_log = "\n".join(
-                            part for part in [competition.error_log, error_log] if part
+                            part
+                            for part in [
+                                competition.error_log,
+                                f"Match #{match.id}: {error_log}" if error_log else None,
+                            ]
+                            if part
                         ).strip() or None
                         await db.execute(
                             update(Competition)
                             .where(Competition.id == competition.id)
                             .values(
-                                status="finished" if scores is not None else "error",
+                                status=competition_status,
                                 error_log=combined_error_log,
-                                finished_at=datetime.now(timezone.utc),
+                                finished_at=competition_finished_at,
                             )
                         )
                     # Match completion is the source of truth for the leaderboard
@@ -657,19 +744,19 @@ async def ensure_schema():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-        def add_submission_columns(sync_conn) -> None:
+        def add_missing_columns(sync_conn) -> None:
             def _refresh_columns(table_name: str):
                 inspector = inspect(sync_conn)
                 return {column["name"]: column for column in inspector.get_columns(table_name)}
 
-            def ensure_column(column_name: str, ddl: str) -> None:
-                columns = set(_refresh_columns("submissions"))
+            def ensure_column(table_name: str, column_name: str, ddl: str) -> None:
+                columns = set(_refresh_columns(table_name))
                 if column_name in columns:
                     return
                 try:
                     sync_conn.execute(text(ddl))
                 except Exception:
-                    columns = set(_refresh_columns("submissions"))
+                    columns = set(_refresh_columns(table_name))
                     if column_name not in columns:
                         raise
 
@@ -685,13 +772,23 @@ async def ensure_schema():
                     )
                 except Exception:
                     columns = _refresh_columns(table_name)
-                    if column_name not in columns or "BIGINT" not in str(columns[column_name]["type"]).upper():
+                    column_type = str(columns[column_name]["type"]).upper() if column_name in columns else ""
+                    if "BIGINT" not in column_type:
                         raise
 
-            ensure_column("name", "ALTER TABLE submissions ADD COLUMN name VARCHAR(64)")
+            ensure_column("submissions", "name", "ALTER TABLE submissions ADD COLUMN name VARCHAR(64)")
             ensure_column(
+                "submissions",
                 "is_dispatched",
                 "ALTER TABLE submissions ADD COLUMN is_dispatched BOOLEAN DEFAULT FALSE",
+            )
+            ensure_column(
+                "matches",
+                "competition_id",
+                "ALTER TABLE matches ADD COLUMN competition_id INTEGER",
+            )
+            sync_conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_matches_competition ON matches (competition_id)")
             )
 
             if sync_conn.dialect.name == "postgresql":
@@ -699,7 +796,7 @@ async def ensure_schema():
                 ensure_bigint("matches", "score_b")
                 ensure_bigint("match_participants", "score")
 
-        await conn.run_sync(add_submission_columns)
+        await conn.run_sync(add_missing_columns)
 
     async with AsyncSessionLocal() as db:
         await backfill_submission_selection(db)

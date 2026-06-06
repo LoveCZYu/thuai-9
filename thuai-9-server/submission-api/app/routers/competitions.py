@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import AuthActor, get_current_actor, require_admin
-from app.models import Competition, CompetitionSlot, MatchParticipant, Submission, Team
+from app.models import Competition, CompetitionSlot, Match, MatchParticipant, Submission, Team
 from app.schemas import (
     CompetitionCreateRequest,
     CompetitionDetailOut,
@@ -69,6 +69,61 @@ async def _sync_competition_slots(
         await db.delete(slot)
 
 
+async def _load_competition_match_counts(
+    db: AsyncSession,
+    competition: Competition,
+) -> tuple[int, int]:
+    rows = await db.execute(
+        select(Match.status, func.count())
+        .where(Match.competition_id == competition.id)
+        .group_by(Match.status)
+    )
+    counts = {status: int(count) for status, count in rows.all()}
+
+    if not counts and competition.match_id is not None:
+        legacy_rows = await db.execute(
+            select(Match.status, func.count())
+            .where(Match.id == competition.match_id)
+            .group_by(Match.status)
+        )
+        counts = {status: int(count) for status, count in legacy_rows.all()}
+
+    return sum(counts.values()), counts.get("finished", 0)
+
+
+async def _load_competition_scores(
+    db: AsyncSession,
+    competition: Competition,
+) -> dict[int, int]:
+    score_rows = await db.execute(
+        select(MatchParticipant.submission_id, func.sum(MatchParticipant.score))
+        .join(Match, Match.id == MatchParticipant.match_id)
+        .where(
+            Match.competition_id == competition.id,
+            Match.status == "finished",
+            MatchParticipant.score.is_not(None),
+        )
+        .group_by(MatchParticipant.submission_id)
+    )
+    score_by_submission = {
+        submission_id: int(total_score)
+        for submission_id, total_score in score_rows.all()
+        if submission_id is not None and total_score is not None
+    }
+    if score_by_submission or competition.match_id is None:
+        return score_by_submission
+
+    legacy_rows = await db.execute(
+        select(MatchParticipant.submission_id, MatchParticipant.score)
+        .where(MatchParticipant.match_id == competition.match_id)
+    )
+    return {
+        submission_id: int(score)
+        for submission_id, score in legacy_rows.all()
+        if submission_id is not None and score is not None
+    }
+
+
 async def _load_slots(db: AsyncSession, competition: Competition) -> list[CompetitionSlotOut]:
     rows = await db.execute(
         select(CompetitionSlot, Team, Submission)
@@ -78,17 +133,7 @@ async def _load_slots(db: AsyncSession, competition: Competition) -> list[Compet
         .order_by(Team.name.asc(), Team.id.asc())
     )
 
-    score_by_submission: dict[int, int] = {}
-    if competition.match_id is not None:
-        score_rows = await db.execute(
-            select(MatchParticipant.submission_id, MatchParticipant.score)
-            .where(MatchParticipant.match_id == competition.match_id)
-        )
-        score_by_submission = {
-            submission_id: score
-            for submission_id, score in score_rows.all()
-            if submission_id is not None and score is not None
-        }
+    score_by_submission = await _load_competition_scores(db, competition)
 
     slots: list[CompetitionSlotOut] = []
     for slot, team, submission in rows.all():
@@ -100,7 +145,9 @@ async def _load_slots(db: AsyncSession, competition: Competition) -> list[Compet
                 selected_submission_name=submission.name if submission is not None else None,
                 selected_submission_status=submission.status if submission is not None else None,
                 updated_at=slot.updated_at,
-                score=serialize_score(score_by_submission.get(submission.id) if submission is not None else None),
+                score=serialize_score(
+                    score_by_submission.get(submission.id) if submission is not None else None
+                ),
             )
         )
     return slots
@@ -113,6 +160,7 @@ async def _serialize_competition(
     include_slots: bool,
 ) -> CompetitionSummaryOut | CompetitionDetailOut:
     slots = await _load_slots(db, competition)
+    match_count, finished_match_count = await _load_competition_match_counts(db, competition)
     current_slot = None
     if actor.team is not None:
         current_slot = next((slot for slot in slots if slot.team_id == actor.team.id), None)
@@ -129,6 +177,8 @@ async def _serialize_competition(
         created_by_name=competition.created_by_name,
         created_by_email=competition.created_by_email,
         match_id=competition.match_id,
+        match_count=match_count,
+        finished_match_count=finished_match_count,
         eligible_team_count=len(slots),
         participant_count=sum(1 for slot in slots if slot.selected_submission_id is not None),
         is_eligible=current_slot is not None,

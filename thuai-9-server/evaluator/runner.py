@@ -22,6 +22,11 @@ LIVE_SERVER_OUTPUT_FILES = (
     "player-stats.json",
     "stat.dat",
 )
+EVALUATION_GAME_DEFAULTS = {
+    "minimumPlayerCount": 2,
+    "tradingDayCount": 3,
+    "infiniteMode": False,
+}
 
 
 @dataclass(frozen=True)
@@ -78,26 +83,25 @@ def _prepare_live_server_config_dir() -> str:
     config_path = os.path.join(config_dir, "config.json")
     legacy_config_path = os.path.join(settings.match_data_dir, "live-server-config", "config.json")
 
-    if not os.path.isfile(config_path):
-        config_payload = {
-            "game": {
-                # Allow arena matches to start even when only one
-                # dispatched ready submission is available.
-                "minimumPlayerCount": 1,
-            }
-        }
+    config_payload: dict = {}
+    load_path = config_path if os.path.isfile(config_path) else legacy_config_path
+    if os.path.isfile(load_path):
+        try:
+            with open(load_path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                config_payload = loaded
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Failed to load live server config from %s", load_path)
 
-        if os.path.isfile(legacy_config_path):
-            try:
-                with open(legacy_config_path, encoding="utf-8") as f:
-                    loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    config_payload = loaded
-            except (OSError, json.JSONDecodeError):
-                logger.warning("Failed to load legacy live server config from %s", legacy_config_path)
+    game_config = config_payload.setdefault("game", {})
+    if not isinstance(game_config, dict):
+        game_config = {}
+        config_payload["game"] = game_config
+    game_config.update(EVALUATION_GAME_DEFAULTS)
 
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(config_payload, f, ensure_ascii=False)
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config_payload, f, ensure_ascii=False)
 
     return config_dir
 
@@ -291,7 +295,7 @@ def run_match(
     agents: list[MatchAgent],
     live_server_image: str | None = None,
 ) -> tuple[dict[int, int] | None, str, dict[int, str]]:
-    """Run all ready submissions in one live arena game.
+    """Run the supplied agents in one live game.
 
     Returns ``(scores, error_log, agent_logs)`` where ``agent_logs`` maps
     each submission id to the captured stdout+stderr of that agent's

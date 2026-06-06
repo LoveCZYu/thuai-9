@@ -48,11 +48,15 @@ class Submission(Base):
 
 class Match(Base):
     __tablename__ = "matches"
+    __table_args__ = (
+        Index("ix_matches_competition", "competition_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     mode: Mapped[str] = mapped_column(String(8), nullable=False)
     submission_a_id: Mapped[int] = mapped_column(Integer, ForeignKey("submissions.id"), nullable=False)
     submission_b_id: Mapped[int] = mapped_column(Integer, ForeignKey("submissions.id"), nullable=False)
+    competition_id: Mapped[int | None] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     score_a: Mapped[int | None] = mapped_column(BigInteger)
     score_b: Mapped[int | None] = mapped_column(BigInteger)

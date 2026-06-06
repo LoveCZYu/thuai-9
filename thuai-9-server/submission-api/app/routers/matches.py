@@ -22,6 +22,7 @@ def _serialize_match(match: Match) -> MatchOut:
         mode=match.mode,
         submission_a_id=match.submission_a_id,
         submission_b_id=match.submission_b_id,
+        competition_id=match.competition_id,
         status=match.status,
         score_a=serialize_score(match.score_a),
         score_b=serialize_score(match.score_b),

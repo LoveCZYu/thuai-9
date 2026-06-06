@@ -77,6 +77,7 @@ class MatchOut(BaseModel):
     mode: str
     submission_a_id: int
     submission_b_id: int
+    competition_id: int | None
     status: str
     score_a: str | None
     score_b: str | None
@@ -238,6 +239,8 @@ class CompetitionSummaryOut(BaseModel):
     created_by_name: str
     created_by_email: str
     match_id: int | None
+    match_count: int
+    finished_match_count: int
     eligible_team_count: int
     participant_count: int
     is_eligible: bool

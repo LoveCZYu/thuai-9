@@ -801,6 +801,7 @@ function renderCompetitionDetail(detail) {
         <div><span>报名截止</span><strong>${formatTime(detail.effective_deadline)}</strong></div>
         <div><span>游戏镜像</span><code>${escapeHtml(detail.live_server_image)}</code></div>
         <div><span>报名数</span><strong>${detail.participant_count} / ${detail.eligible_team_count}</strong></div>
+        <div><span>对局进度</span><strong>${detail.finished_match_count || 0} / ${detail.match_count || 0}</strong></div>
       </div>
       ${detail.description ? `<p class="detail-description">${escapeHtml(detail.description)}</p>` : ""}
       ${detail.error_log ? `<pre class="detail-error">${escapeHtml(detail.error_log)}</pre>` : ""}

@@ -16,19 +16,19 @@ async def ensure_schema() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-        def add_submission_columns(sync_conn) -> None:
+        def add_missing_columns(sync_conn) -> None:
             def _refresh_columns(table_name: str):
                 inspector = inspect(sync_conn)
                 return {column["name"]: column for column in inspector.get_columns(table_name)}
 
-            def ensure_column(column_name: str, ddl: str) -> None:
-                columns = set(_refresh_columns("submissions"))
+            def ensure_column(table_name: str, column_name: str, ddl: str) -> None:
+                columns = set(_refresh_columns(table_name))
                 if column_name in columns:
                     return
                 try:
                     sync_conn.execute(text(ddl))
                 except Exception:
-                    columns = set(_refresh_columns("submissions"))
+                    columns = set(_refresh_columns(table_name))
                     if column_name not in columns:
                         raise
 
@@ -44,13 +44,23 @@ async def ensure_schema() -> None:
                     )
                 except Exception:
                     columns = _refresh_columns(table_name)
-                    if column_name not in columns or "BIGINT" not in str(columns[column_name]["type"]).upper():
+                    column_type = str(columns[column_name]["type"]).upper() if column_name in columns else ""
+                    if "BIGINT" not in column_type:
                         raise
 
-            ensure_column("name", "ALTER TABLE submissions ADD COLUMN name VARCHAR(64)")
+            ensure_column("submissions", "name", "ALTER TABLE submissions ADD COLUMN name VARCHAR(64)")
             ensure_column(
+                "submissions",
                 "is_dispatched",
                 "ALTER TABLE submissions ADD COLUMN is_dispatched BOOLEAN DEFAULT FALSE",
+            )
+            ensure_column(
+                "matches",
+                "competition_id",
+                "ALTER TABLE matches ADD COLUMN competition_id INTEGER",
+            )
+            sync_conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_matches_competition ON matches (competition_id)")
             )
 
             if sync_conn.dialect.name == "postgresql":
@@ -58,7 +68,7 @@ async def ensure_schema() -> None:
                 ensure_bigint("matches", "score_b")
                 ensure_bigint("match_participants", "score")
 
-        await conn.run_sync(add_submission_columns)
+        await conn.run_sync(add_missing_columns)
 
     async with AsyncSessionLocal() as session:
         await session.execute(

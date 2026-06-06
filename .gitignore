@@ -3,6 +3,8 @@
 .claude
 .codex
 .vscode
+**/__pycache__/
+*.pyc
 **superpowers/
 web/image/
 server/data
